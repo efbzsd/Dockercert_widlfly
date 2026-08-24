@@ -110,10 +110,33 @@ container_id() {
 
 container_cacerts_path() {
   local name="$1"
-  local java_home
+  local java_home env_store resolved p
+  env_store="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name" \
+    | tr ' \t' '\n' \
+    | sed -n 's/.*javax.net.ssl.trustStore=//p' \
+    | head -n1)"
+  if [[ -n "$env_store" ]]; then
+    resolved="$(container_realpath "$name" "$env_store" || true)"
+    echo "${resolved:-$env_store}"
+    return
+  fi
   java_home="$(container_java_home "$name")"
   [[ -n "$java_home" ]] || die "JAVA_HOME nem található a(z) $name konténerben"
-  echo "${java_home%/}/${CACERTS_REL}"
+  p="${java_home%/}/${CACERTS_REL}"
+  resolved="$(container_realpath "$name" "$p" || true)"
+  echo "${resolved:-$p}"
+}
+
+container_realpath() {
+  local name="$1"
+  local path="$2"
+  docker exec -u 0 "$name" sh -c "readlink -f \"$path\" 2>/dev/null || realpath \"$path\" 2>/dev/null"
+}
+
+container_is_symlink() {
+  local name="$1"
+  local path="$2"
+  docker exec -u 0 "$name" sh -c "test -L \"$path\"" >/dev/null 2>&1
 }
 
 # docker cp a konténerbe root tulajdonnal másol; az eredeti UID/GID/mód kell a JVM usernek.
@@ -123,14 +146,31 @@ container_file_meta() {
   docker exec -u 0 "$name" stat -c '%u %g %a' "$path" 2>/dev/null
 }
 
-restore_container_file_meta() {
+# Szimbolikus linken keresztüli docker cp lecseréli a linket, és a rossz fájlt írhatja felül.
+# /tmp-n keresztül másolunk, a célfájlba cp/cat megy (a symlink célja megmarad).
+container_copy_out() {
   local name="$1"
-  local path="$2"
-  local uid="$3"
-  local gid="$4"
-  local mode="$5"
-  docker exec -u 0 "$name" chown "${uid}:${gid}" "$path" >/dev/null
-  docker exec -u 0 "$name" chmod "$mode" "$path" >/dev/null
+  local src="$2"
+  local dest="$3"
+  docker exec -u 0 "$name" sh -c "cp -f \"$src\" /tmp/.cacerts.export && chmod 644 /tmp/.cacerts.export"
+  docker cp "${name}:/tmp/.cacerts.export" "$dest"
+  docker exec -u 0 "$name" rm -f /tmp/.cacerts.export
+}
+
+container_copy_in() {
+  local name="$1"
+  local src="$2"
+  local dest="$3"
+  local uid="$4"
+  local gid="$5"
+  local mode="$6"
+  docker cp "$src" "${name}:/tmp/.cacerts.import"
+  docker exec -u 0 "$name" sh -c "
+    cp -f /tmp/.cacerts.import \"$dest\"
+    chown ${uid}:${gid} \"$dest\"
+    chmod ${mode} \"$dest\"
+    rm -f /tmp/.cacerts.import
+  "
 }
 
 # A keytool az image USER-ével (pl. jboss) futna, a host Backup_* könyvtárába
@@ -476,7 +516,7 @@ finish_ok() {
 main() {
   local preset="${1:-}"
   local container image cacerts_path ts workdir backup_name work_name storepass
-  local f cid_before cid_after orig_uid orig_gid orig_mode meta_after
+  local f cid_before cid_after orig_uid orig_gid orig_mode meta_after java_home_cacerts
 
   [[ -d "$CERTIMPORT_DIR" ]] || die "certimport könyvtár nem található: $CERTIMPORT_DIR"
 
@@ -496,13 +536,13 @@ main() {
   info "Konténer: $container"
   info "Image: $image"
   info "Konténer ID: ${cid_before:0:12} (az eredeti konténer megmarad)"
-  info "Cacerts a konténerben: $cacerts_path"
+  info "Cacerts a konténerben (feloldott útvonal): $cacerts_path"
+  java_home_cacerts="$(container_java_home "$container")/${CACERTS_REL}"
+  if container_is_symlink "$container" "$java_home_cacerts"; then
+    info "JAVA_HOME cacerts szimbolikus link, a célt használjuk (docker cp nem bontja a linket)"
+  fi
   info "Munkakönyvtár: $workdir"
 
-  docker cp "${container}:${cacerts_path}" "$workdir/$backup_name"
-  cp "$workdir/$backup_name" "$workdir/$work_name"
-  chmod u+rwx "$workdir" 2>/dev/null || true
-  chmod u+rw "$workdir/$backup_name" "$workdir/$work_name" 2>/dev/null || true
   orig_uid=""
   orig_gid=""
   orig_mode=""
@@ -511,7 +551,12 @@ main() {
   else
     die "az eredeti cacerts tulajdonos nem olvasható a konténerből"
   fi
-  info "Kulcstár kimásolva: $backup_name"
+
+  container_copy_out "$container" "$cacerts_path" "$workdir/$backup_name"
+  cp "$workdir/$backup_name" "$workdir/$work_name"
+  chmod u+rwx "$workdir" 2>/dev/null || true
+  chmod u+rw "$workdir/$backup_name" "$workdir/$work_name" 2>/dev/null || true
+  info "Kulcstár kimásolva: $backup_name ($(wc -c < "$workdir/$backup_name" | tr -d ' ') bájt)"
   info "Munkapéldány: $work_name"
 
   read -r -s -p "Kulcstár jelszó [changeit]: " storepass || true
@@ -538,14 +583,13 @@ main() {
   done
 
   info ""
-  info "Visszamásolás a konténerbe..."
-  docker cp "$workdir/$work_name" "${container}:${cacerts_path}"
-  restore_container_file_meta "$container" "$cacerts_path" "$orig_uid" "$orig_gid" "$orig_mode"
+  info "Visszamásolás a konténerbe (eredeti uid/gid/mód megmarad, symlink nem törik)..."
+  container_copy_in "$container" "$workdir/$work_name" "$cacerts_path" "$orig_uid" "$orig_gid" "$orig_mode"
   meta_after="$(container_file_meta "$container" "$cacerts_path" || true)"
   if [[ "$meta_after" != "${orig_uid} ${orig_gid} ${orig_mode}" ]]; then
     die "a cacerts tulajdonos visszaállítása sikertelen (most: ${meta_after:-ismeretlen}, elvárt: ${orig_uid} ${orig_gid} ${orig_mode})"
   fi
-  info "Cacerts tulajdonos visszaállítva: uid=${orig_uid} gid=${orig_gid} mód=${orig_mode}"
+  info "Cacerts tulajdonos: uid=${orig_uid} gid=${orig_gid} mód=${orig_mode}"
   info "Konténer újraindítása (az eredeti példány megmarad): $container"
   docker restart "$container" >/dev/null
   cid_after="$(container_id "$container")"

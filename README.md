@@ -37,7 +37,7 @@ A `latest` WildFly image x86-64-v3 CPU-t igényelhet; a fenti JDK 17-es tag rég
    - `<konténer>_cacert` — munkapéldány
 3. Kulcstár jelszó: Enter = `changeit`.
 4. A `certimport/` minden ismert tanúsítványán végigmegy. Ha a cert már bent van, kiírja a bent lévő és az importálandó adatait; `Y/n`, Enter = felülírás.
-5. Visszamásolja a kulcstárat, **visszaállítja az eredeti UID/GID/jogosultságot**, majd `docker restart`. A konténer ID változatlan marad.
+5. Visszamásolja a kulcstárat a **feloldott** útvonalra (`readlink -f`, pl. `/etc/pki/ca-trust/extracted/java/cacerts`), szimbolikus linket nem tör. Az eredeti UID/GID/mód (`chown`/`chmod`) megmarad, majd `docker restart`.
 
 ## Támogatott fájltípusok
 
