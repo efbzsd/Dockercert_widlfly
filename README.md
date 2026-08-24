@@ -1,3 +1,4 @@
+# v2
 # Dockercert WildFly
 
 Hostoldali bash script, ami futó WildFly Docker-konténerek Java `cacerts` truststore-jába importál tanúsítványokat. A munka a hoston történik: a kulcstárat `docker cp` másolja ki, openssl és keytool dolgozik rajta, majd a módosított fájl visszakerül a **ugyanabba** a konténerbe (`docker restart`). Az eredeti konténer nem törlődik és nem cserélődik le.
@@ -59,3 +60,5 @@ A műveletek a `naplo.txt` fájlba íródnak, hozzáfűzve:
 - `certimport/` — bemeneti tanúsítványok
 - `Backup_*` — futtatásonkénti munkamásolat (gitignore)
 - `naplo.txt` — üzemeltetési napló (gitignore)
+
+
