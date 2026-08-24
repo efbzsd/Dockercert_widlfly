@@ -25,10 +25,8 @@ A `latest` WildFly image x86-64-v3 CPU-t igényelhet; a fenti JDK 17-es tag rég
 ## Használat
 
 ```bash
-./import_cacerts.sh
-./import_cacerts.sh wildfly_1
-# vagy a szerveren használt név:
 ./certimport.sh
+./certimport.sh wildfly_1
 ```
 
 1. A script listázza a futó konténereket. Minden sornál megjelenik az **utolsó módosítás** dátuma (`év.hó.nap óra:perc:mp`) és az eredmény (`OK` / `HIBA`) a `naplo.txt` alapján.
