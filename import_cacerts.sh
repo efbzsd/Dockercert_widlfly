@@ -188,15 +188,28 @@ container_assert_symlink() {
 # A keytool az image USER-ével (pl. jboss) futna, a host Backup_* könyvtárába
 # pedig a hívó usernek kell írnia. Linuxon + SELinuxon ez Permission denied.
 # Host UID + :z relabel: írható bind-mount, a fájl tulajdonosa a hívó marad.
+# A JKS „migrate to PKCS12” warning nem hiba: a konténer eredeti tára JKS, azt tartjuk.
 run_keytool() {
   local image="$1"
   shift
+  local err rc
+  err="$(mktemp "${TMPDIR:-/tmp}/keytool.err.XXXXXX")"
+  set +e
   docker run --rm \
     --user "$(id -u):$(id -g)" \
     --entrypoint keytool \
     -v "${SCRIPT_DIR}:/hostwork:z" \
     "$image" \
-    "$@"
+    "$@" 2>"$err"
+  rc=$?
+  set -e
+  grep -v -E \
+    -e 'The JKS keystore uses a proprietary format' \
+    -e 'It is recommended to migrate to PKCS12' \
+    -e 'keytool -importkeystore -srckeystore' \
+    "$err" >&2 || true
+  rm -f "$err"
+  return "$rc"
 }
 
 list_running_containers() {
