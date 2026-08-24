@@ -10,7 +10,7 @@ Hostoldali bash script, ami futó WildFly Docker-konténerek Java `cacerts` trus
 - bash
 - `certimport/` könyvtár a beimportálandó fájlokkal
 
-A Java `keytool` a WildFly image-ből fut, a hostra nem kell JDK.
+A Java `keytool` a célkonténer image-éből fut (`--user` = a hívó UID, SELinux `:z` a bind-mounton), a hostra nem kell JDK.
 
 ## Tesztkonténerek
 
@@ -27,6 +27,8 @@ A `latest` WildFly image x86-64-v3 CPU-t igényelhet; a fenti JDK 17-es tag rég
 ```bash
 ./import_cacerts.sh
 ./import_cacerts.sh wildfly_1
+# vagy a szerveren használt név:
+./certimport.sh
 ```
 
 1. A script listázza a futó konténereket. Minden sornál megjelenik az **utolsó módosítás** dátuma (`év.hó.nap óra:perc:mp`) és az eredmény (`OK` / `HIBA`) a `naplo.txt` alapján.

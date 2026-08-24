@@ -61,8 +61,10 @@ hostwork_path() {
 
 cert_info() {
   local pem="$1"
-  openssl x509 -in "$pem" -noout \
+  openssl x509 -in "$pem" -noout -nameopt RFC2253,utf8 \
     -subject -issuer -dates -serial -fingerprint -sha256 2>/dev/null \
+    || openssl x509 -in "$pem" -noout \
+      -subject -issuer -dates -serial -fingerprint -sha256 2>/dev/null \
     || die "nem olvasható tanúsítvány: $pem"
 }
 
@@ -114,12 +116,16 @@ container_cacerts_path() {
   echo "${java_home%/}/${CACERTS_REL}"
 }
 
+# A keytool az image USER-ével (pl. jboss) futna, a host Backup_* könyvtárába
+# pedig a hívó usernek kell írnia. Linuxon + SELinuxon ez Permission denied.
+# Host UID + :z relabel: írható bind-mount, a fájl tulajdonosa a hívó marad.
 run_keytool() {
   local image="$1"
   shift
   docker run --rm \
+    --user "$(id -u):$(id -g)" \
     --entrypoint keytool \
-    --mount "type=bind,src=${SCRIPT_DIR},dst=/hostwork" \
+    -v "${SCRIPT_DIR}:/hostwork:z" \
     "$image" \
     "$@"
 }
@@ -478,6 +484,8 @@ main() {
 
   docker cp "${container}:${cacerts_path}" "$workdir/$backup_name"
   cp "$workdir/$backup_name" "$workdir/$work_name"
+  chmod u+rwx "$workdir" 2>/dev/null || true
+  chmod u+rw "$workdir/$backup_name" "$workdir/$work_name" 2>/dev/null || true
   info "Kulcstár kimásolva: $backup_name"
   info "Munkapéldány: $work_name"
 
