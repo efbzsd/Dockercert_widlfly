@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Java cacerts tanúsítványimport WildFly konténerekbe.
-# Hostoldali script: openssl a PEM/lánc kezeléshez, docker cp/restart a konténerhez,
+# Hostoldali script: openssl a PEM/CER/lánc kezeléshez, docker cp/restart a konténerhez,
 # keytool (a konténer image-éből) a JKS/PKCS12 kulcstár módosításához.
+# Támogatott bemenet: .pem, .cer (PEM vagy DER), PKCS#7 lánc.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -132,6 +133,62 @@ select_container() {
     fi
     echo "Érvénytelen választás." >&2
   done
+}
+
+file_ext() {
+  local base ext
+  base="$(basename "$1")"
+  ext="${base##*.}"
+  echo "$ext" | tr '[:upper:]' '[:lower:]'
+}
+
+is_importable_cert() {
+  case "$(file_ext "$1")" in
+    pem|cer|crt|der|p7b|p7c) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# PEM/DER X.509 vagy PKCS#7 -> PEM (egy cert vagy lánc).
+convert_to_pem() {
+  local src="$1"
+  local dest="$2"
+  local tmp=""
+
+  rm -f "$dest"
+
+  if grep -a -q -- "-----BEGIN CERTIFICATE-----" "$src" 2>/dev/null; then
+    cp "$src" "$dest"
+    return 0
+  fi
+
+  if grep -a -q -- "-----BEGIN PKCS7-----" "$src" 2>/dev/null \
+     || grep -a -q -- "-----BEGIN PKCS #7-----" "$src" 2>/dev/null; then
+    openssl pkcs7 -in "$src" -print_certs -out "$dest" 2>/dev/null \
+      && grep -a -q -- "-----BEGIN CERTIFICATE-----" "$dest" && return 0
+  fi
+
+  if openssl x509 -inform DER -in "$src" -out "$dest" 2>/dev/null; then
+    return 0
+  fi
+
+  if openssl pkcs7 -inform DER -in "$src" -print_certs -out "$dest" 2>/dev/null; then
+    grep -q -- "BEGIN CERTIFICATE" "$dest" && return 0
+  fi
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/cerb64.XXXXXX")"
+  if base64 -d < "$src" > "$tmp" 2>/dev/null || base64 -D < "$src" > "$tmp" 2>/dev/null; then
+    if openssl x509 -inform DER -in "$tmp" -out "$dest" 2>/dev/null; then
+      rm -f "$tmp"
+      return 0
+    fi
+    if openssl pkcs7 -inform DER -in "$tmp" -print_certs -out "$dest" 2>/dev/null; then
+      rm -f "$tmp"
+      grep -q -- "BEGIN CERTIFICATE" "$dest" && return 0
+    fi
+  fi
+  rm -f "$tmp" "$dest"
+  return 1
 }
 
 split_pem_chain() {
@@ -277,10 +334,17 @@ process_certimport_file() {
   local src="$5"
   local base splitdir count i part
 
+  local pemfile
+
   base="$(basename "$src")"
   splitdir="$workdir/split_${base}"
+  pemfile="$workdir/converted_${base}.pem"
   rm -rf "$splitdir"
-  count="$(split_pem_chain "$src" "$splitdir")"
+  if ! convert_to_pem "$src" "$pemfile"; then
+    info "Kihagyva (nem olvasható tanúsítvány): $base"
+    return 0
+  fi
+  count="$(split_pem_chain "$pemfile" "$splitdir")"
   ((count > 0)) || { info "Nincs tanúsítvány a fájlban: $base"; return 0; }
 
   if ((count == 1)); then
@@ -343,6 +407,10 @@ main() {
 
   for f in "${files[@]}"; do
     [[ -f "$f" ]] || continue
+    if ! is_importable_cert "$f"; then
+      info "Kihagyva (nem tanúsítványfájl): $(basename "$f")"
+      continue
+    fi
     process_certimport_file "$workdir" "$image" "$workdir/$work_name" "$storepass" "$f"
   done
 

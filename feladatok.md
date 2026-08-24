@@ -22,4 +22,4 @@ adatait, és az importálandó adatait. y igen , n nem, alapértelmezett a y, si
 Amikor minden elemen végigmentél a certimport könyvtárban, másold vissza a cacert állományt a wildfly konténeren belül
 a megfelelő helyre, és docker restart al indítsd újra.
 
-Végezz teszteket a 3 konténerrel, a teszt tanúsítványokat is megkaptad.
+Végezz teszteket a 3 konténerrel, a teszt tanúsítványokat is megkaptad, lehet pem vagy cer is.
