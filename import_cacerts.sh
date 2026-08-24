@@ -1,17 +1,42 @@
 #!/usr/bin/env bash
 # Java cacerts tanúsítványimport WildFly konténerekbe.
-# Hostoldali script: openssl a PEM/CER/lánc kezeléshez, docker cp/restart a konténerhez,
-# keytool (a konténer image-éből) a JKS/PKCS12 kulcstár módosításához.
-# Támogatott bemenet: .pem, .cer (PEM vagy DER), PKCS#7 lánc.
+# Hostoldali script: openssl a tanúsítványokhoz, docker cp/restart a konténerhez.
+# Az eredeti konténert nem törli és nem cseréli le, csak a cacerts fájlt írja vissza.
+# Támogatott bemenet: .cer .crt .pem .der .key, valamint PKCS#7 lánc (.p7b/.p7c).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CERTIMPORT_DIR="${CERTIMPORT_DIR:-$SCRIPT_DIR/certimport}"
+LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/naplo.txt}"
 DEFAULT_STOREPASS="changeit"
 CACERTS_REL="lib/security/cacerts"
 
-die() { echo "HIBA: $*" >&2; exit 1; }
+CONTAINER_NAME=""
+IMPORTED=()
+SKIPPED=()
+KS_INDEX=""
+
+log_event() {
+  local result="$1"
+  local cname="$2"
+  local details="$3"
+  local ts
+  ts="$(date '+%Y.%m.%d %H:%M:%S')"
+  printf '%s | %s | %s | %s\n' "$ts" "$cname" "$result" "$details" >> "$LOG_FILE"
+}
+
+die() {
+  echo "HIBA: $*" >&2
+  log_event "HIBA" "${CONTAINER_NAME:--}" "$*"
+  exit 1
+}
+
 info() { echo "$*"; }
+
+cleanup() {
+  rm -f "${KS_INDEX:-}"
+}
+trap cleanup EXIT
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "hiányzó parancs: $1"
@@ -77,6 +102,10 @@ container_image() {
   docker inspect -f '{{.Config.Image}}' "$1"
 }
 
+container_id() {
+  docker inspect -f '{{.Id}}' "$1"
+}
+
 container_cacerts_path() {
   local name="$1"
   local java_home
@@ -97,6 +126,29 @@ run_keytool() {
 
 list_running_containers() {
   docker ps --format '{{.Names}}' | sort
+}
+
+# naplo.txt utolsó sora a konténerhez: dátum | név | OK|HIBA | ...
+last_log_line() {
+  local name="$1"
+  [[ -f "$LOG_FILE" ]] || return 1
+  grep -E "^[0-9.]+ [0-9:]+ \| ${name} \| " "$LOG_FILE" 2>/dev/null | tail -n1
+}
+
+format_container_row() {
+  local idx="$1"
+  local name="$2"
+  local line ts result
+  line="$(last_log_line "$name" || true)"
+  if [[ -z "$line" ]]; then
+    printf '  %d) %-12s  utolsó módosítás: %-19s  eredmény: %s\n' \
+      "$idx" "$name" "nincs adat" "-"
+    return
+  fi
+  ts="$(echo "$line" | awk -F ' \\| ' '{print $1}')"
+  result="$(echo "$line" | awk -F ' \\| ' '{print $3}')"
+  printf '  %d) %-12s  utolsó módosítás: %-19s  eredmény: %s\n' \
+    "$idx" "$name" "$ts" "$result"
 }
 
 select_container() {
@@ -122,11 +174,14 @@ select_container() {
 
   echo "Futó konténerek:" >&2
   for i in "${!names[@]}"; do
-    printf '  %d) %s\n' "$((i + 1))" "${names[$i]}" >&2
+    format_container_row "$((i + 1))" "${names[$i]}" >&2
   done
 
   while true; do
-    read -r -p "Válassz konténert [1-${#names[@]}]: " choice
+    if ! read -r -p "Válassz konténert [1-${#names[@]}]: " choice; then
+      echo "Nincs választás." >&2
+      exit 1
+    fi
     if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#names[@]})); then
       echo "${names[$((choice - 1))]}"
       return
@@ -144,12 +199,23 @@ file_ext() {
 
 is_importable_cert() {
   case "$(file_ext "$1")" in
-    pem|cer|crt|der|p7b|p7c) return 0 ;;
+    cer|crt|pem|der|key|p7b|p7c) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-# PEM/DER X.509 vagy PKCS#7 -> PEM (egy cert vagy lánc).
+has_certificate_block() {
+  grep -a -q -- "-----BEGIN CERTIFICATE-----" "$1" 2>/dev/null
+}
+
+is_private_key_only() {
+  local src="$1"
+  grep -a -q -- "PRIVATE KEY-----" "$src" 2>/dev/null || return 1
+  has_certificate_block "$src" && return 1
+  return 0
+}
+
+# PEM/DER X.509, PKCS#7 vagy cert+key csomag -> PEM (egy cert vagy lánc).
 convert_to_pem() {
   local src="$1"
   local dest="$2"
@@ -157,7 +223,7 @@ convert_to_pem() {
 
   rm -f "$dest"
 
-  if grep -a -q -- "-----BEGIN CERTIFICATE-----" "$src" 2>/dev/null; then
+  if has_certificate_block "$src"; then
     cp "$src" "$dest"
     return 0
   fi
@@ -165,7 +231,7 @@ convert_to_pem() {
   if grep -a -q -- "-----BEGIN PKCS7-----" "$src" 2>/dev/null \
      || grep -a -q -- "-----BEGIN PKCS #7-----" "$src" 2>/dev/null; then
     openssl pkcs7 -in "$src" -print_certs -out "$dest" 2>/dev/null \
-      && grep -a -q -- "-----BEGIN CERTIFICATE-----" "$dest" && return 0
+      && has_certificate_block "$dest" && return 0
   fi
 
   if openssl x509 -inform DER -in "$src" -out "$dest" 2>/dev/null; then
@@ -173,7 +239,7 @@ convert_to_pem() {
   fi
 
   if openssl pkcs7 -inform DER -in "$src" -print_certs -out "$dest" 2>/dev/null; then
-    grep -q -- "BEGIN CERTIFICATE" "$dest" && return 0
+    has_certificate_block "$dest" && return 0
   fi
 
   tmp="$(mktemp "${TMPDIR:-/tmp}/cerb64.XXXXXX")"
@@ -184,7 +250,7 @@ convert_to_pem() {
     fi
     if openssl pkcs7 -inform DER -in "$tmp" -print_certs -out "$dest" 2>/dev/null; then
       rm -f "$tmp"
-      grep -q -- "BEGIN CERTIFICATE" "$dest" && return 0
+      has_certificate_block "$dest" && return 0
     fi
   fi
   rm -f "$tmp" "$dest"
@@ -215,15 +281,12 @@ split_pem_chain() {
   echo "$n"
 }
 
-KS_INDEX=""
-
 refresh_keystore_index() {
   local image="$1"
   local store_host="$2"
   local pass="$3"
   if [[ -z "$KS_INDEX" ]]; then
     KS_INDEX="$(mktemp "${TMPDIR:-/tmp}/ksindex.XXXXXX")"
-    trap 'rm -f "$KS_INDEX"' EXIT
   fi
   run_keytool "$image" -list -v -keystore "$(hostwork_path "$store_host")" -storepass "$pass" \
     > "$KS_INDEX" 2>/dev/null
@@ -290,7 +353,7 @@ import_one_cert() {
   cert_info "$pem"
 
   if alias="$(find_alias_by_fp "$fp")"; then
-    existing_pem="$workdir/existing_$(echo "$alias" | sed 's/[^a-zA-Z0-9._-]/_/g').pem"
+    existing_pem="$workdir/existing_$(echo "$alias" | sed 's/[^a-z0-9._-]/_/g').pem"
     export_alias_pem "$image" "$store_host" "$pass" "$alias" "$existing_pem"
     info ""
     info "A tanúsítvány már benne van a kulcstárban (alias: $alias)."
@@ -301,6 +364,7 @@ import_one_cert() {
     cert_info "$pem"
     if ! ask_overwrite; then
       info "Kihagyva: $label"
+      SKIPPED+=("$label")
       return 0
     fi
     run_keytool "$image" \
@@ -324,6 +388,7 @@ import_one_cert() {
   rm -f "$workdir/import_tmp.pem"
   refresh_keystore_index "$image" "$store_host" "$pass"
   info "Importálva alias=$alias ($label)"
+  IMPORTED+=("$label")
 }
 
 process_certimport_file() {
@@ -332,20 +397,26 @@ process_certimport_file() {
   local store_host="$3"
   local pass="$4"
   local src="$5"
-  local base splitdir count i part
-
-  local pemfile
+  local base splitdir count i part pemfile
 
   base="$(basename "$src")"
   splitdir="$workdir/split_${base}"
   pemfile="$workdir/converted_${base}.pem"
   rm -rf "$splitdir"
+
+  if is_private_key_only "$src"; then
+    info "Kihagyva (privát kulcs, a cacerts truststore-ba nem kerül): $base"
+    SKIPPED+=("$base (privát kulcs)")
+    return 0
+  fi
+
   if ! convert_to_pem "$src" "$pemfile"; then
     info "Kihagyva (nem olvasható tanúsítvány): $base"
+    SKIPPED+=("$base (olvashatatlan)")
     return 0
   fi
   count="$(split_pem_chain "$pemfile" "$splitdir")"
-  ((count > 0)) || { info "Nincs tanúsítvány a fájlban: $base"; return 0; }
+  ((count > 0)) || { info "Nincs tanúsítvány a fájlban: $base"; SKIPPED+=("$base (üres)"); return 0; }
 
   if ((count == 1)); then
     info ""
@@ -363,16 +434,34 @@ process_certimport_file() {
   done
 }
 
+finish_ok() {
+  local container="$1"
+  local imported_txt skipped_txt details
+  if ((${#IMPORTED[@]} > 0)); then
+    imported_txt="${IMPORTED[*]}"
+  else
+    imported_txt="nincs"
+  fi
+  details="importált: $imported_txt"
+  if ((${#SKIPPED[@]} > 0)); then
+    skipped_txt="${SKIPPED[*]}"
+    details="$details; kihagyva: $skipped_txt"
+  fi
+  log_event "OK" "$container" "$details"
+}
+
 main() {
   local preset="${1:-}"
   local container image cacerts_path ts workdir backup_name work_name storepass
-  local f
+  local f cid_before cid_after
 
   [[ -d "$CERTIMPORT_DIR" ]] || die "certimport könyvtár nem található: $CERTIMPORT_DIR"
 
   container="$(select_container "$preset")"
+  CONTAINER_NAME="$container"
   image="$(container_image "$container")"
   cacerts_path="$(container_cacerts_path "$container")"
+  cid_before="$(container_id "$container")"
 
   ts="$(date +%Y%m%d_____%H:%M:%S)"
   workdir="$SCRIPT_DIR/Backup_${container}_${ts}"
@@ -383,6 +472,7 @@ main() {
 
   info "Konténer: $container"
   info "Image: $image"
+  info "Konténer ID: ${cid_before:0:12} (az eredeti konténer megmarad)"
   info "Cacerts a konténerben: $cacerts_path"
   info "Munkakönyvtár: $workdir"
 
@@ -417,9 +507,14 @@ main() {
   info ""
   info "Visszamásolás a konténerbe..."
   docker cp "$workdir/$work_name" "${container}:${cacerts_path}"
-  info "Konténer újraindítása: $container"
+  info "Konténer újraindítása (az eredeti példány megmarad): $container"
   docker restart "$container" >/dev/null
+  cid_after="$(container_id "$container")"
+  if [[ "$cid_before" != "$cid_after" ]]; then
+    die "a konténer azonosítója megváltozott, az eredeti példány nem maradt meg"
+  fi
   info "Kész. Backup: $workdir"
+  finish_ok "$container"
 }
 
 main "$@"
