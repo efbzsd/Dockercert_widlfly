@@ -166,11 +166,23 @@ container_copy_in() {
   local mode="$6"
   docker cp "$src" "${name}:/tmp/.cacerts.import"
   docker exec -u 0 "$name" sh -c "
+    if test -L \"$dest\"; then
+      echo \"HIBA: a cél szimbolikus link, nem írható felül: $dest\" >&2
+      exit 1
+    fi
     cp -f /tmp/.cacerts.import \"$dest\"
     chown ${uid}:${gid} \"$dest\"
     chmod ${mode} \"$dest\"
     rm -f /tmp/.cacerts.import
   "
+}
+
+container_assert_symlink() {
+  local name="$1"
+  local path="$2"
+  [[ -n "$path" ]] || return 0
+  docker exec -u 0 "$name" sh -c "test -L \"$path\"" >/dev/null 2>&1 \
+    || die "a szimbolikus link eltűnt: $path"
 }
 
 # A keytool az image USER-ével (pl. jboss) futna, a host Backup_* könyvtárába
@@ -517,6 +529,8 @@ main() {
   local preset="${1:-}"
   local container image cacerts_path ts workdir backup_name work_name storepass
   local f cid_before cid_after orig_uid orig_gid orig_mode meta_after java_home_cacerts
+  local pki_java_cacerts="/etc/pki/java/cacerts"
+  local keep_java_home_link="" keep_pki_java_link=""
 
   [[ -d "$CERTIMPORT_DIR" ]] || die "certimport könyvtár nem található: $CERTIMPORT_DIR"
 
@@ -538,8 +552,15 @@ main() {
   info "Konténer ID: ${cid_before:0:12} (az eredeti konténer megmarad)"
   info "Cacerts a konténerben (feloldott útvonal): $cacerts_path"
   java_home_cacerts="$(container_java_home "$container")/${CACERTS_REL}"
+  keep_java_home_link=""
+  keep_pki_java_link=""
   if container_is_symlink "$container" "$java_home_cacerts"; then
-    info "JAVA_HOME cacerts szimbolikus link, a célt használjuk (docker cp nem bontja a linket)"
+    keep_java_home_link="$java_home_cacerts"
+    info "JAVA_HOME cacerts szimbolikus link, a célt használjuk"
+  fi
+  if container_is_symlink "$container" "$pki_java_cacerts"; then
+    keep_pki_java_link="$pki_java_cacerts"
+    info "Megőrzendő link: $pki_java_cacerts"
   fi
   info "Munkakönyvtár: $workdir"
 
@@ -590,6 +611,8 @@ main() {
     die "a cacerts tulajdonos visszaállítása sikertelen (most: ${meta_after:-ismeretlen}, elvárt: ${orig_uid} ${orig_gid} ${orig_mode})"
   fi
   info "Cacerts tulajdonos: uid=${orig_uid} gid=${orig_gid} mód=${orig_mode}"
+  [[ -n "$keep_java_home_link" ]] && container_assert_symlink "$container" "$keep_java_home_link"
+  [[ -n "$keep_pki_java_link" ]] && container_assert_symlink "$container" "$keep_pki_java_link"
   info "Konténer újraindítása (az eredeti példány megmarad): $container"
   docker restart "$container" >/dev/null
   cid_after="$(container_id "$container")"
