@@ -116,6 +116,23 @@ container_cacerts_path() {
   echo "${java_home%/}/${CACERTS_REL}"
 }
 
+# docker cp a konténerbe root tulajdonnal másol; az eredeti UID/GID/mód kell a JVM usernek.
+container_file_meta() {
+  local name="$1"
+  local path="$2"
+  docker exec -u 0 "$name" stat -c '%u %g %a' "$path" 2>/dev/null
+}
+
+restore_container_file_meta() {
+  local name="$1"
+  local path="$2"
+  local uid="$3"
+  local gid="$4"
+  local mode="$5"
+  docker exec -u 0 "$name" chown "${uid}:${gid}" "$path" >/dev/null
+  docker exec -u 0 "$name" chmod "$mode" "$path" >/dev/null
+}
+
 # A keytool az image USER-ével (pl. jboss) futna, a host Backup_* könyvtárába
 # pedig a hívó usernek kell írnia. Linuxon + SELinuxon ez Permission denied.
 # Host UID + :z relabel: írható bind-mount, a fájl tulajdonosa a hívó marad.
@@ -459,7 +476,7 @@ finish_ok() {
 main() {
   local preset="${1:-}"
   local container image cacerts_path ts workdir backup_name work_name storepass
-  local f cid_before cid_after
+  local f cid_before cid_after orig_uid orig_gid orig_mode meta_after
 
   [[ -d "$CERTIMPORT_DIR" ]] || die "certimport könyvtár nem található: $CERTIMPORT_DIR"
 
@@ -486,6 +503,14 @@ main() {
   cp "$workdir/$backup_name" "$workdir/$work_name"
   chmod u+rwx "$workdir" 2>/dev/null || true
   chmod u+rw "$workdir/$backup_name" "$workdir/$work_name" 2>/dev/null || true
+  orig_uid=""
+  orig_gid=""
+  orig_mode=""
+  if IFS=' ' read -r orig_uid orig_gid orig_mode < <(container_file_meta "$container" "$cacerts_path"); then
+    info "Eredeti cacerts tulajdonos a konténerben: uid=${orig_uid} gid=${orig_gid} mód=${orig_mode}"
+  else
+    die "az eredeti cacerts tulajdonos nem olvasható a konténerből"
+  fi
   info "Kulcstár kimásolva: $backup_name"
   info "Munkapéldány: $work_name"
 
@@ -515,6 +540,12 @@ main() {
   info ""
   info "Visszamásolás a konténerbe..."
   docker cp "$workdir/$work_name" "${container}:${cacerts_path}"
+  restore_container_file_meta "$container" "$cacerts_path" "$orig_uid" "$orig_gid" "$orig_mode"
+  meta_after="$(container_file_meta "$container" "$cacerts_path" || true)"
+  if [[ "$meta_after" != "${orig_uid} ${orig_gid} ${orig_mode}" ]]; then
+    die "a cacerts tulajdonos visszaállítása sikertelen (most: ${meta_after:-ismeretlen}, elvárt: ${orig_uid} ${orig_gid} ${orig_mode})"
+  fi
+  info "Cacerts tulajdonos visszaállítva: uid=${orig_uid} gid=${orig_gid} mód=${orig_mode}"
   info "Konténer újraindítása (az eredeti példány megmarad): $container"
   docker restart "$container" >/dev/null
   cid_after="$(container_id "$container")"
